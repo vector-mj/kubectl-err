@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n kubectl-err && bash -n test/lib.sh && bash -n test/run.sh &&
+             for t in test/[0-9]*.test.sh; do bash -n "$t"; done
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Install kind
+        run: |
+          set -euo pipefail
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+
+      - name: Run the suite against a real cluster
+        run: ./test/run.sh

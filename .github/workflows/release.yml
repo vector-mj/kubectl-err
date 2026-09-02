@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a reproducible archive
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          # stamp the tag into the script so --version and the manifest cannot disagree
+          sed -i "s|^VERSION=.*|VERSION=\"${VERSION}\"|" kubectl-err
+          ./kubectl-err --version | grep -qx "kubectl-err ${VERSION}"
+          FILES=(kubectl-err)
+          if [ -f LICENSE ]; then FILES+=(LICENSE); fi
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -cf - "${FILES[@]}" \
+            | gzip -n -9 > kubectl-err.tar.gz
+          {
+            echo "VERSION=${VERSION}"
+            echo "SHA=$(sha256sum kubectl-err.tar.gz | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
+      - name: Render the krew manifest
+        run: |
+          set -euo pipefail
+          sed -e "s|^  version: .*|  version: ${VERSION}|" \
+              -e "s|^    uri: .*|    uri: https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/kubectl-err.tar.gz|" \
+              -e "s|^    sha256: .*|    sha256: ${SHA}|" \
+              .krew.yaml > err.yaml
+          echo "--- err.yaml ---"; cat err.yaml
+          grep -q REPLACE_WITH err.yaml && { echo "manifest still has a placeholder"; exit 1; } || true
+
+      - name: Install the plugin from the manifest, as a user would
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/krew-linux_amd64.tar.gz"
+          tar zxf krew-linux_amd64.tar.gz
+          ./krew-linux_amd64 install krew
+          export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
+          kubectl krew install --manifest=err.yaml --archive=kubectl-err.tar.gz
+          kubectl krew list | grep -qx err
+          kubectl err --help > /dev/null
+          echo "manifest installs and the plugin runs"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kubectl-err.tar.gz
+            err.yaml
+          body: |
+            Install with krew:
+
+                kubectl krew install --manifest-url=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/err.yaml
+
+            `err.yaml` is the krew manifest for this release, with the archive's real sha256.
