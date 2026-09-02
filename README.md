@@ -48,18 +48,6 @@ Pod         payments   Deployment/api (x3)  ImagePullBackOff  18m  api: Back-off
 Pod         payments   ledger-0             Restarting        40s  app: restarted 4x, last exit 137 OOMKilled    ip-10-0-2-88  registry.example.com/ledger:1.9.3
 ```
 
-```sh
-kubectl err po,pvc,svc         # only these kinds; omit to check all of them
-kubectl err no                 # just the nodes
-kubectl err -n payments        # one namespace (nodes stay cluster-wide)
-kubectl err -w                 # refresh every second, until interrupted
-kubectl err -e                 # add Warning events from the last hour
-kubectl err -g 300             # widen the startup grace window to 5 minutes
-kubectl err --full             # do not truncate the DETAIL column
-kubectl err --context staging  # a different cluster
-kubectl err -o json | jq '.[] | select(.sev <= 2)'   # only the serious findings
-```
-
 ## Install
 
 ```sh
@@ -122,5 +110,3 @@ is unreachable — so a failed check never reads as a healthy one. Drop it in CI
 | Namespace | `Terminating` for over a minute |
 | Flux, Argo, cert-manager, external-secrets | `Ready`/`Healthy`/`Available`/`Synced` false, when the CRD is installed |
 | Event (`-e`) | `type=Warning` in the last hour |
-
-`Succeeded` pods are never shown.

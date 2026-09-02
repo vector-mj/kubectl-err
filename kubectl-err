@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# kubectl-err - bird's-eye view of everything unhealthy in a Kubernetes cluster.
+set -euo pipefail
+
+VERSION="v0.1.0"
+KUBECTL=${KUBECTL:-kubectl}
+read -r -a KUBECTL_CMD <<<"$KUBECTL"
+GRACE=${KUBECTL_ERR_GRACE:-60}
+INTERVAL=${KUBECTL_ERR_INTERVAL:-1}
+RESTART_WINDOW=${KUBECTL_ERR_RESTART_WINDOW:-60}
+SCOPE=(--all-namespaces)
+CHUNK=(--chunk-size=500)
+TIMEOUT=${KUBECTL_ERR_TIMEOUT:-10}
+REQ=(--request-timeout="${TIMEOUT}s")
+TIMEOUT_BIN=$(command -v timeout || command -v gtimeout || true)
+capped() {
+  local secs=$1; shift
+  if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" "${secs}s" "$@"; else "$@"; fi
+}
+EVENTS=0 WIDE=0 WATCH=0 JSON=0 FULL=0
+WANT=""
+
+usage() {
+  cat <<'USAGE'
+kubectl err - list everything unhealthy in the cluster.
+
+Usage: kubectl err [KINDS] [-n NAMESPACE] [-o wide|json] [-w] [-g SECONDS] [-e]
+                   [--full] [--context NAME] [--kubeconfig PATH] [-h]
+
+  KINDS                comma-separated kinds to check, kubectl-style short names:
+                       po no deploy sts ds job cj svc ing hpa pdb pvc pv ns ev crd
+                       e.g. "kubectl err po,pvc,svc". Omit it to check all of them.
+
+  -n, --namespace NS   scope namespaced resources to NS (default: all namespaces)
+  -o wide, --wide      add NODE and IMAGE columns (full image:tag)
+  -o json              emit the findings as JSON instead of a table
+  -w, --watch          refresh every second until interrupted
+  -g, --grace SECONDS  hide startup states for a pod's first SECONDS (default 60)
+  -t, --timeout SECS   per-request timeout; past it the cluster is called unreachable
+                       (default 10, or KUBECTL_ERR_TIMEOUT)
+  -e, --events         also show Warning events from the last hour
+      --full           do not truncate the DETAIL column
+      --context NAME   kubectl context to use
+      --kubeconfig P   kubeconfig file to use
+      --version        print the version and exit
+  -h, --help           this
+
+USAGE
+}
+
+canon() {
+  case "$1" in
+    po|pod|pods)                                  echo Pod ;;
+    no|node|nodes)                                echo Node ;;
+    deploy|deployment|deployments)                echo Deployment ;;
+    sts|statefulset|statefulsets)                 echo StatefulSet ;;
+    ds|daemonset|daemonsets)                      echo DaemonSet ;;
+    job|jobs)                                     echo Job ;;
+    cj|cronjob|cronjobs)                          echo CronJob ;;
+    svc|service|services)                         echo Service ;;
+    ing|ingress|ingresses)                        echo Ingress ;;
+    hpa|horizontalpodautoscaler|horizontalpodautoscalers) echo HPA ;;
+    pdb|poddisruptionbudget|poddisruptionbudgets) echo PDB ;;
+    pvc|persistentvolumeclaim|persistentvolumeclaims)     echo PVC ;;
+    pv|persistentvolume|persistentvolumes)        echo PV ;;
+    ns|namespace|namespaces)                      echo Namespace ;;
+    ev|event|events)                              echo Event ;;
+    crd|crds)                                     echo CRD ;;
+    *) return 1 ;;
+  esac
+}
+
+want() {
+  [ -z "$WANT" ] && return 0
+  case " $WANT " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--namespace) [ $# -ge 2 ] || { echo "-n needs a namespace" >&2; exit 2; }
+                    SCOPE=(-n "$2"); shift 2 ;;
+    -e|--events)    EVENTS=1; shift ;;
+    -w|--watch)     WATCH=1; shift ;;
+    --full)         FULL=1; shift ;;
+    -g|--grace)     case "${2:-}" in ''|*[!0-9]*) echo "-g needs whole seconds" >&2; exit 2 ;; esac
+                    GRACE=$2; shift 2 ;;
+    -t|--timeout)   case "${2:-}" in ''|*[!0-9]*) echo "-t needs whole seconds" >&2; exit 2 ;; esac
+                    TIMEOUT=$2; REQ=(--request-timeout="${TIMEOUT}s"); shift 2 ;;
+    --context)      [ $# -ge 2 ] || { echo "--context needs a name" >&2; exit 2; }
+                    KUBECTL_CMD+=(--context "$2"); shift 2 ;;
+    --kubeconfig)   [ $# -ge 2 ] || { echo "--kubeconfig needs a path" >&2; exit 2; }
+                    KUBECTL_CMD+=(--kubeconfig "$2"); shift 2 ;;
+    -o)             case "${2:-}" in
+                      wide) WIDE=1 ;; json) JSON=1 ;;
+                      *) echo "-o takes wide or json" >&2; exit 2 ;;
+                    esac; shift 2 ;;
+    --wide)         WIDE=1; shift ;;
+    --version)      echo "kubectl-err $VERSION"; exit 0 ;;
+    # no -v alias: kubectl spells verbosity -v, and shadowing it would be a trap
+    -h|--help)      usage; exit 0 ;;
+    -*)             echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *)              [ -z "$WANT" ] || { echo "kinds given more than once" >&2; exit 2; }
+                    for tok in $(printf '%s' "$1" | tr ',' ' '); do
+                      c=$(canon "$tok") || {
+                        echo "unknown kind: $tok" >&2
+                        echo "supported: po no deploy sts ds job cj svc ing hpa pdb pvc pv ns ev crd" >&2
+                        exit 2; }
+                      WANT="$WANT $c"
+                    done
+                    WANT="${WANT# }"
+                    case " $WANT " in *" Event "*) EVENTS=1 ;; esac
+                    shift ;;
+  esac
+done
+
+command -v jq >/dev/null || { echo "kubectl-err needs jq on PATH" >&2; exit 2; }
+
+get() {
+  local kind=$1; shift
+  local out
+  if ! out=$(capped "$((TIMEOUT + 5))" "${KUBECTL_CMD[@]}" get "$kind" "$@" "${CHUNK[@]}" "${REQ[@]}" -o json 2>/dev/null </dev/null); then
+    echo "kubectl-err: cannot list $kind (skipped)" >&2
+    out='{"items":[]}'
+  fi
+  printf '%s' "$out"
+}
+
+OPTIONAL_KINDS="kustomizations.kustomize.toolkit.fluxcd.io
+helmreleases.helm.toolkit.fluxcd.io
+gitrepositories.source.toolkit.fluxcd.io
+rollouts.argoproj.io
+certificates.cert-manager.io
+externalsecrets.external-secrets.io"
+
+present_kinds() {
+  local have want=""
+  have=$(capped "$TIMEOUT" "${KUBECTL_CMD[@]}" api-resources --no-headers -o name "${REQ[@]}" 2>/dev/null </dev/null || true)
+  [ -n "$have" ] || return 0
+  while read -r k; do
+    [ -n "$k" ] && grep -qxF "$k" <<<"$have" && want="$want,$k"
+  done <<<"$OPTIONAL_KINDS"
+  printf '%s' "${want#,}"
+}
+
+COMMON='def clean: gsub("[[:cntrl:]]"; " ");
+        def secs($t): if ($t // "") == "" then 0 else ((now - ($t | fromdateiso8601)) | floor) end;
+        def ago: (if . < 0 then 0 else . end)
+                 | if . > 86400 then "\(./86400 | floor)d" elif . > 3600 then "\(./3600 | floor)h"
+                   elif . > 60 then "\(./60 | floor)m" else "\(. | floor)s" end;
+        def starting: ["ContainerCreating","PodInitializing"];
+        def soft: ["NotReady","Restarting","ContainerCreating","PodInitializing","Pending","Terminating"];'
+
+PODS_JQ="$COMMON"'
+([ $ev[0].items[]? | select(.involvedObject.kind == "Pod") ]
+ | sort_by(.lastTimestamp // .eventTime // .metadata.creationTimestamp // "")
+ | map({key: "\(.metadata.namespace)/\(.involvedObject.name)",
+        value: "\(.reason // "Warning"): \(.message // "")"}) | from_entries) as $evmap
+| [ .items[]
+  | select(.status.phase != "Succeeded")
+  | . as $p
+  | ((.status.containerStatuses // []) + (.status.initContainerStatuses // [])) as $cs
+  | [ $cs[] | select(.state.waiting != null)
+            | select(.state.waiting.reason // "" | . as $r | starting | index($r) == null) ] as $w
+  | [ $cs[] | select(.state.waiting != null)
+            | select(.state.waiting.reason // "" | . as $r | starting | index($r) != null) ] as $boot
+  | [ $cs[] | select((.state.terminated.exitCode // 0) != 0) ] as $t
+  | (now - (($p.metadata.creationTimestamp // "1970-01-01T00:00:00Z") | fromdateiso8601)) as $age
+  | ($age < $grace) as $young
+  | ($p.spec.nodeName // "-") as $node
+  | (([$p.spec.containers[]?.image] | join(",")) | if . == "" then "-" else . end) as $images
+  | (.metadata.ownerReferences[0]? // null) as $or
+  # ponytail: a ReplicaSet is named <deployment>-<hash>, so drop the last segment to name the
+  # Deployment. Wrong only for a bare ReplicaSet nobody deploys by hand.
+  | ( if $or == null then $p.metadata.name
+      elif $or.kind == "ReplicaSet" then "Deployment/\($or.name | sub("-[^-]+$"; ""))"
+      elif (["StatefulSet","DaemonSet","Job","ReplicationController"] | index($or.kind)) != null
+      then "\($or.kind)/\($or.name)"
+      else $p.metadata.name end ) as $owner
+  | secs($p.metadata.creationTimestamp) as $born
+  # a readiness probe that waits 3 minutes before its first check has not failed at 61s
+  | (([$p.spec.containers[]? | .readinessProbe // empty
+       | (.initialDelaySeconds // 0) + ((.periodSeconds // 10) * (.failureThreshold // 3))] | max) // 0) as $probewait
+  | ( ( select($p.metadata.deletionTimestamp == null) | $w[] | {age: $born, reason: (.state.waiting.reason // "Waiting"),
+                detail: "\(.name): \(.state.waiting.message // "")\(if (.restartCount // 0) > 0 then " (restarts: \(.restartCount))" else "" end)",
+                image: (.image // $images)} )
+    , ( select($p.metadata.deletionTimestamp == null) | $t[] | {age: secs(.state.terminated.finishedAt), reason: (.state.terminated.reason // "Error"),
+                detail: "\(.name): exit \(.state.terminated.exitCode) \(.state.terminated.message // "")",
+                image: (.image // $images)} )
+    , ( select($young | not and $p.metadata.deletionTimestamp == null) | $boot[]
+        | {age: $born, reason: .state.waiting.reason,
+           detail: "\(.name): stuck for \($age | ago)",
+           image: (.image // $images)} )
+    , ( select($p.status.phase == "Pending" and ($w | length) == 0 and ($boot | length) == 0
+               and ($young | not) and $p.metadata.deletionTimestamp == null)
+        | {age: $born, reason: "Pending",
+           detail: ([$p.status.conditions[]? | select(.status == "False") | (.message // .reason)]
+                    | map(select(. != "")) | unique | join("; ")),
+           image: $images} )
+    , ( select($p.status.phase == "Failed" and ($w | length) == 0 and ($t | length) == 0
+               and $p.metadata.deletionTimestamp == null)
+        | {age: $born, reason: ($p.status.reason // "Failed"), detail: ($p.status.message // ""), image: $images} )
+    , ( select($p.status.phase == "Running" and ($w | length) == 0 and ($t | length) == 0
+               and ($boot | length) == 0 and ($young | not) and ($born >= $probewait)
+               and $p.metadata.deletionTimestamp == null
+               and ([$p.status.conditions[]? | select(.type == "Ready" and .status == "False")] | length) > 0)
+        | {age: secs([$p.status.conditions[]? | select(.type == "Ready") | .lastTransitionTime] | first),
+           reason: "NotReady",
+           detail: "containers not ready: \([$cs[] | select(.ready != true) | .name] | join(","))",
+           image: ([$cs[] | select(.ready != true) | .image // empty] | join(",") | if . == "" then $images else . end)} )
+    , ( select($p.status.phase == "Running" and ($w | length) == 0 and ($t | length) == 0
+               and ($boot | length) == 0
+               and ([$p.status.conditions[]? | select(.type == "Ready" and .status == "False")] | length) == 0)
+        | $cs[]
+        | select((.restartCount // 0) > 0)
+        # ponytail: a crash-looper is briefly Running and Ready between restarts, which is the
+        # only reason this rule exists. It has to be currently up and only just up: a container
+        # that has held on longer than the window restarted for some other reason - a node
+        # reboot, an eviction, a laptop resuming - and is fine now. An init container that has
+        # finished is not running at all, so it drops out here too.
+        | select(.state.running != null)
+        | select($p.metadata.deletionTimestamp == null)
+        | select(secs(.state.running.startedAt) < $restartwin)
+        | {age: secs(.state.running.startedAt),
+           reason: "Restarting",
+           detail: "\(.name): restarted \(.restartCount)x, last exit \(.lastState.terminated.exitCode // "?") \(.lastState.terminated.reason // "")",
+           image: (.image // $images)} )
+    , ( select($p.metadata.deletionTimestamp != null)
+        # a pod is not "stuck" until it has outlived its own graceful shutdown deadline
+        | select(secs($p.metadata.deletionTimestamp) > ($p.metadata.deletionGracePeriodSeconds // 30))
+        | {age: secs($p.metadata.deletionTimestamp),
+           reason: "Terminating", detail: "stuck since \($p.metadata.deletionTimestamp)", image: $images} )
+    )
+  | . + {kind: "Pod", namespace: $p.metadata.namespace, name: $p.metadata.name, owner: $owner, node: $node}
+  # the reason says what; the newest Warning event says why
+  | . + {detail: (.reason as $r
+                  | if ((starting + ["Pending"]) | index($r)) != null
+                    then (.detail + (($evmap["\(.namespace)/\(.name)"] // "")
+                                     | if . == "" then "" else " | " + . end))
+                    else .detail end)}
+]
+# one row per owner+reason: a 50-replica rollout with a bad image is one line, not fifty
+| group_by([.namespace, .owner, .reason])
+| map(.[0] + (if length > 1
+              then {name: "\(.[0].owner) (x\(length))", age: (map(.age) | max),
+                    node: (if (map(.node) | unique | length) == 1 then .[0].node else "*" end)}
+              else {} end))
+| .[]
+| del(.owner)
+| . + {sev: (.reason as $r | if (soft | index($r)) != null then 4 else 3 end)}'
+
+NODES_JQ="$COMMON"'
+.items[]
+| . as $n
+| ( ( .status.conditions[]? | select(.type == "Ready" and .status != "True")
+      | {age: secs(.lastTransitionTime), reason: "NotReady", detail: (.message // .reason // "")} )
+  , ( .status.conditions[]? | select(.type != "Ready" and .status == "True")
+      | {age: secs(.lastTransitionTime), reason: .type, detail: (.message // .reason // "")} )
+  , ( select($n.spec.unschedulable == true)
+      | {age: secs($n.metadata.creationTimestamp), reason: "SchedulingDisabled", detail: "cordoned"} )
+  )
+| . + {sev: 1, kind: "Node", namespace: "-", name: $n.metadata.name, node: "-", image: "-"}'
+
+WORKLOADS_JQ="$COMMON"'
+.items[]
+| . as $wl | (.status // {}) as $s
+| (if $wl.kind == "DaemonSet"
+   then [($s.numberReady // 0), ($s.desiredNumberScheduled // 0)]
+   else [($s.readyReplicas // 0), ($wl.spec.replicas // 0)] end) as $rd
+| [$s.conditions[]? | select(.status == "False" or .type == "ReplicaFailure")] as $bad
+| secs(($bad[0].lastTransitionTime // $wl.metadata.creationTimestamp)) as $badfor
+| ( ( select($rd[0] < $rd[1] and $badfor >= $grace)
+      | {age: secs(($bad[0].lastTransitionTime // $wl.metadata.creationTimestamp)),
+         reason: "Unavailable",
+         detail: "\($rd[0])/\($rd[1]) ready\($bad | map(.reason // empty)
+                  | if length > 0 then " (" + join(",") + ")" else "" end)"} )
+  , ( select($rd[0] >= $rd[1] and ($bad | length) > 0 and $badfor >= $grace)
+      | {age: secs($bad[0].lastTransitionTime),
+         reason: "RolloutStalled",
+         detail: "\($bad[0].reason // "stalled"): \($bad[0].message // "")\(if ($s.updatedReplicas // null) != null then " (updated \($s.updatedReplicas)/\($rd[1]))" else "" end)"} )
+  )
+| . + {sev: 2, kind: $wl.kind, namespace: $wl.metadata.namespace, name: $wl.metadata.name, node: "-",
+       image: (([$wl.spec.template.spec.containers[]?.image] | join(",")) | if . == "" then "-" else . end)}'
+
+JOBS_JQ="$COMMON"'
+.items[]
+| select((.status.failed // 0) > 0)
+# a job that failed twice and then succeeded still carries failed>0; it is not a problem
+| select([.status.conditions[]? | select(.type == "Complete" and .status == "True")] | length == 0)
+| {sev: 2, kind: "Job", namespace: .metadata.namespace, name: .metadata.name, reason: "Failed",
+   age: secs(([.status.conditions[]? | select(.type == "Failed") | .lastTransitionTime] | first)
+             // .metadata.creationTimestamp),
+   detail: "\(.status.failed) failed \([.status.conditions[]? | select(.type == "Failed") | .message // empty] | join("; "))",
+   node: "-", image: (([.spec.template.spec.containers[]?.image] | join(",")) | if . == "" then "-" else . end)}'
+
+CRONJOBS_JQ="$COMMON"'
+.items[] | select(.spec.suspend == true)
+| {sev: 5, kind: "CronJob", namespace: .metadata.namespace, name: .metadata.name, reason: "Suspended",
+   age: secs(.metadata.creationTimestamp),
+   detail: "schedule \(.spec.schedule // "?") is suspended, last run \(.status.lastScheduleTime // "never")",
+   node: "-", image: "-"}'
+
+SVC_JQ="$COMMON"'
+([ $ep[0].items[]? | {key: "\(.metadata.namespace)/\(.metadata.name)",
+                      value: ([.subsets[]?.addresses[]?] | length)} ] | from_entries) as $epmap
+| .items[]
+| select(.spec.type != "ExternalName" and .spec.selector != null)
+| select(($epmap["\(.metadata.namespace)/\(.metadata.name)"] // 0) == 0)
+| select(secs(.metadata.creationTimestamp) >= $grace)
+| {sev: 2, kind: "Service", namespace: .metadata.namespace, name: .metadata.name, reason: "NoEndpoints",
+   age: secs(.metadata.creationTimestamp),
+   detail: "selector matches no ready pods: \(.spec.selector | to_entries | map("\(.key)=\(.value)") | join(","))",
+   node: "-", image: "-"}'
+
+ING_JQ="$COMMON"'
+.items[] | select(([.status.loadBalancer.ingress[]?] | length) == 0)
+| select(secs(.metadata.creationTimestamp) >= $grace)
+| {sev: 5, kind: "Ingress", namespace: .metadata.namespace, name: .metadata.name, reason: "NoAddress",
+   age: secs(.metadata.creationTimestamp),
+   detail: "no load balancer address assigned (class \(.spec.ingressClassName // "-"))",
+   node: "-", image: "-"}'
+
+HPA_JQ="$COMMON"'
+.items[] | . as $h
+| .status.conditions[]?
+| select((.type == "AbleToScale" or .type == "ScalingActive") and .status == "False")
+| select(secs(.lastTransitionTime) >= $grace)
+| {sev: 5, kind: "HPA", namespace: $h.metadata.namespace, name: $h.metadata.name, reason: .type,
+   age: secs(.lastTransitionTime),
+   detail: "\(.reason // ""): \(.message // "")", node: "-", image: "-"}'
+
+PDB_JQ="$COMMON"'
+.items[]
+| select((.status.disruptionsAllowed // 1) == 0)
+| select((.status.expectedPods // 0) > 0)
+| {sev: 5, kind: "PDB", namespace: .metadata.namespace, name: .metadata.name, reason: "NoDisruptionsAllowed",
+   age: secs(.metadata.creationTimestamp),
+   detail: "\(.status.currentHealthy // 0)/\(.status.desiredHealthy // 0) healthy - drains and upgrades will block",
+   node: "-", image: "-"}'
+
+PVC_JQ="$COMMON"'
+([ $sc[0].items[]? ]) as $classes
+| ([ $classes[] | {key: .metadata.name, value: (.volumeBindingMode // "Immediate")} ] | from_entries) as $mode
+| ([ $classes[]
+     | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true")
+     | .volumeBindingMode // "Immediate" ] | first // "Immediate") as $defmode
+| .items[]
+| select(.status.phase != "Bound")
+| . as $c
+| (if ($c.spec.storageClassName // null) == null then $defmode
+   else ($mode[$c.spec.storageClassName] // "Immediate") end) as $bind
+# ponytail: a WaitForFirstConsumer claim stays Pending until a pod wants it - that is the
+# design, not a fault. A pod actually blocked on one shows up as a Pending pod anyway.
+| select($c.status.phase != "Pending" or $bind != "WaitForFirstConsumer")
+| {sev: 5, kind: "PVC", namespace: .metadata.namespace, name: .metadata.name,
+   age: secs(.metadata.creationTimestamp),
+   reason: (.status.phase // "Unknown"),
+   detail: "storageClass: \(.spec.storageClassName // "-") (\($bind))",
+   node: "-", image: (.spec.volumeName // "-")}'
+
+PV_JQ="$COMMON"'
+.items[] | (.status.phase // "") as $ph | select((["Bound","Available"] | index($ph)) == null)
+| {sev: 5, kind: "PV", namespace: "-", name: .metadata.name, reason: (.status.phase // "Unknown"),
+   age: secs(.metadata.creationTimestamp),
+   detail: "\(.status.message // "claim: \(.spec.claimRef.name // "-")")", node: "-", image: "-"}'
+
+NS_JQ="$COMMON"'
+.items[]
+| select(.status.phase == "Terminating")
+| select((.metadata.deletionTimestamp // "" | if . == "" then now else fromdateiso8601 end) < (now - 60))
+| {sev: 5, kind: "Namespace", namespace: "-", name: .metadata.name, reason: "Terminating",
+   age: secs(.metadata.deletionTimestamp),
+   detail: "stuck since \(.metadata.deletionTimestamp // "?") - usually a finalizer",
+   node: "-", image: "-"}'
+
+CRD_JQ="$COMMON"'
+.items[] | . as $c
+| .status.conditions[]?
+| select((.type == "Ready" or .type == "Healthy" or .type == "Available" or .type == "Synced") and .status == "False")
+| select(secs(.lastTransitionTime // $c.metadata.creationTimestamp) >= $grace)
+| {sev: 2, kind: $c.kind, namespace: ($c.metadata.namespace // "-"), name: $c.metadata.name,
+   age: secs(.lastTransitionTime // $c.metadata.creationTimestamp),
+   reason: (.reason // "NotReady"), detail: (.message // ""), node: "-", image: "-"}'
+
+EVENTS_JQ="$COMMON"'
+.items[]
+| select(((.lastTimestamp // .eventTime // .metadata.creationTimestamp // "")
+          | if . == "" then 0 else fromdateiso8601 end) > (now - 3600))
+| {sev: 6, kind: "Event", namespace: (.metadata.namespace // "-"),
+   age: secs(.lastTimestamp // .eventTime // .metadata.creationTimestamp),
+   name: "\(.involvedObject.kind // "?")/\(.involvedObject.name // "?")",
+   reason: (.reason // "Warning"), detail: (.message // ""),
+   node: (.source.host // "-"), image: "-"}'
+
+collect() {
+  local d; d=$(mktemp -d)
+  echo '{"items":[]}' > "$d/ev.json"; echo '{"items":[]}' > "$d/ep.json"; echo '{"items":[]}' > "$d/sc.json"
+  want Pod     && ( get events "${SCOPE[@]}" --field-selector type=Warning > "$d/ev.json" ) &
+  want Service && ( get endpoints "${SCOPE[@]}" > "$d/ep.json" ) &
+  want PVC     && ( get storageclasses > "$d/sc.json" ) &
+  wait
+
+  want Pod  && ( get pods "${SCOPE[@]}" | jq -c --argjson grace "$GRACE" --argjson restartwin "$RESTART_WINDOW" --slurpfile ev "$d/ev.json" "$PODS_JQ" > "$d/r01" ) &
+  want Node && ( get nodes | jq -c "$NODES_JQ" > "$d/r02" ) &
+  { want Deployment || want StatefulSet || want DaemonSet; } \
+            && ( get deployments,statefulsets,daemonsets "${SCOPE[@]}" \
+                 | jq -c --argjson grace "$GRACE" "$WORKLOADS_JQ" \
+                 | jq -c --arg w "$WANT" 'select($w == "" or (($w | split(" ")) | index(.kind) != null))' > "$d/r03" ) &
+  want Job       && ( get jobs "${SCOPE[@]}" | jq -c "$JOBS_JQ" > "$d/r04" ) &
+  want CronJob   && ( get cronjobs "${SCOPE[@]}" | jq -c "$CRONJOBS_JQ" > "$d/r05" ) &
+  want Service   && ( get services "${SCOPE[@]}" | jq -c --argjson grace "$GRACE" --slurpfile ep "$d/ep.json" "$SVC_JQ" > "$d/r06" ) &
+  want Ingress   && ( get ingress "${SCOPE[@]}" | jq -c --argjson grace "$GRACE" "$ING_JQ" > "$d/r07" ) &
+  want HPA       && ( get hpa "${SCOPE[@]}" | jq -c --argjson grace "$GRACE" "$HPA_JQ" > "$d/r08" ) &
+  want PDB       && ( get pdb "${SCOPE[@]}" | jq -c "$PDB_JQ" > "$d/r09" ) &
+  want PVC       && ( get pvc "${SCOPE[@]}" | jq -c --slurpfile sc "$d/sc.json" "$PVC_JQ" > "$d/r10" ) &
+  want PV        && ( get pv | jq -c "$PV_JQ" > "$d/r11" ) &
+  want Namespace && ( get namespaces | jq -c "$NS_JQ" > "$d/r12" ) &
+  if [ -n "${CRD_KINDS:-}" ]; then
+    ( get "$CRD_KINDS" "${SCOPE[@]}" | jq -c --argjson grace "$GRACE" "$CRD_JQ" > "$d/r13" ) &
+  fi
+  if [ "$EVENTS" = 1 ]; then
+    ( jq -c "$EVENTS_JQ" < "$d/ev.json" > "$d/r14" ) &
+  fi
+  wait
+
+  cat "$d"/r* 2>/dev/null | grep -v '^[[:space:]]*$' || true
+  find "$d" -mindepth 1 -delete 2>/dev/null || true
+  rmdir "$d" 2>/dev/null || true
+}
+
+render() {
+  local rows=$1 cols=6 body count spaces count_w spaces_w
+  if [ -z "$rows" ]; then
+    [ "$JSON" = 1 ] && echo '[]' || echo "All clear."
+    return 0
+  fi
+  if [ "$JSON" = 1 ]; then
+    printf '%s\n' "$rows" | jq -s 'sort_by(.sev, .kind, .namespace, .name)'
+    return 1
+  fi
+  [ "$WIDE" = 1 ] && cols=8
+  body=$(printf '%s\n' "$rows" | jq -r --argjson full "$FULL" '
+      def clean: gsub("[[:cntrl:]]"; " ");
+      def trunc: if $full == 1 or (length <= 160) then . else .[0:157] + "..." end;
+      def ago: (if . < 0 then 0 else . end)
+               | if . > 86400 then "\(./86400 | floor)d" elif . > 3600 then "\(./3600 | floor)h"
+                 elif . > 60 then "\(./60 | floor)m" else "\(. | floor)s" end;
+      [(.sev | tostring), .kind, .namespace, (.name | clean), .reason, ((.age // 0) | ago),
+       (.detail | clean | trunc), .node, .image] | @tsv' \
+    | sort -t"$(printf '\t')" -k1,1n -k2,2 -k3,3 -k4,4 | cut -f2-)
+  { printf 'KIND\tNAMESPACE\tNAME\tREASON\tAGE\tDETAIL\tNODE\tIMAGE\n'; printf '%s\n' "$body"; } \
+    | cut -f"1-$cols" \
+    | if command -v column >/dev/null; then column -t -s "$(printf '\t')"; else cat; fi
+  count=$(printf '%s\n' "$body" | grep -c . || true)
+  spaces=$(printf '%s\n' "$body" | cut -f2 | grep -v '^-$' | sort -u | grep -c . || true)
+  [ "$count" = 1 ]  && count_w="problem"   || count_w="problems"
+  [ "$spaces" = 1 ] && spaces_w="namespace" || spaces_w="namespaces"
+  if [ "$spaces" -gt 0 ]; then
+    printf '\n%s %s in %s %s\n' "$count" "$count_w" "$spaces" "$spaces_w"
+  else
+    printf '\n%s %s\n' "$count" "$count_w"
+  fi
+  return 1
+}
+
+preflight() {
+  local out attempt
+  for attempt in 1 2; do
+    if out=$(capped "$TIMEOUT" "${KUBECTL_CMD[@]}" version -o json "${REQ[@]}" 2>&1 </dev/null) \
+       && grep -q serverVersion <<<"$out"; then
+      return 0
+    fi
+    [ "$attempt" = 1 ] && sleep 1
+  done
+  echo "kubectl-err: cannot reach the cluster (gave up after ${TIMEOUT}s)" >&2
+  printf '%s\n' "$out" | grep -vE '^[{}[:space:]"]' | head -3 | sed 's/^/  /' >&2
+  echo "  raise -t/KUBECTL_ERR_TIMEOUT to wait longer, or check: kubectl config current-context" >&2
+  exit 2
+}
+
+preflight
+
+CRD_KINDS=""
+if want CRD; then CRD_KINDS=$(present_kinds); fi
+
+if [ "$WATCH" = 1 ]; then
+  while :; do
+    rows=$(collect)
+    [ -t 1 ] && printf '\033[H\033[2J'
+    printf 'kubectl err - %s (every %ss, ctrl-c to stop)\n\n' "$(date +%T)" "$INTERVAL"
+    render "$rows" || true
+    sleep "$INTERVAL"
+  done
+fi
+
+if render "$(collect)"; then exit 0; else exit 1; fi
