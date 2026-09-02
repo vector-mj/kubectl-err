@@ -1,0 +1,37 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: err
+spec:
+  version: v0.1.0
+  homepage: https://github.com/vector-mj/kubectl-err
+  shortDescription: Show every unhealthy workload and node in the cluster
+  description: |
+    One screen answering one question: what is broken right now?
+
+    Scans pods, nodes, deployments, statefulsets, daemonsets, jobs and PVCs and
+    prints only what is unhealthy - CrashLoopBackOff, ImagePullBackOff, Pending,
+    Evicted, Error, stuck Terminating, NotReady nodes, node pressure, cordoned
+    nodes, under-replicated workloads, failed jobs and unbound claims.
+
+    Exits 1 when anything is unhealthy, so it drops straight into CI or a probe.
+  caveats: |
+    Requires jq (https://jqlang.github.io/jq/) on your PATH.
+
+    Usage:
+      kubectl err                 # whole cluster
+      kubectl err -n prod         # one namespace (nodes stay cluster-wide)
+      kubectl err -o wide         # add NODE and full image:tag columns
+      kubectl err -e              # add Warning events from the last hour
+  platforms:
+  - selector:
+      matchExpressions:
+      - key: os
+        operator: In
+        values: [darwin, linux]
+    uri: https://github.com/vector-mj/kubectl-err/releases/download/v0.1.0/kubectl-err.tar.gz
+    sha256: REPLACE_WITH_SHA256_OF_THE_RELEASE_TARBALL
+    bin: kubectl-err
+    files:
+    - from: kubectl-err
+      to: .
